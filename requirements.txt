@@ -1,0 +1,9 @@
+transformers 
+peft 
+accelerate 
+datasets 
+sentence-transformers 
+google-generativeai 
+fastapi 
+uvicorn
+fitz
