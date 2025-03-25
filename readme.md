@@ -61,7 +61,7 @@ GEMINI_API_KEY=your_api_key_here
 🔹 Run the FastAPI Server
 
 ```sh
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 The API will be available at:
