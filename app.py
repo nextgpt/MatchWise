@@ -8,11 +8,24 @@ from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 import json
+from pathlib import Path
+import shutil
+from datetime import datetime
+import uuid
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
+
+# 定义上传目录
+UPLOAD_DIR = Path("uploads")
+TEMP_DIR = UPLOAD_DIR / "temp"
+PROCESSED_DIR = UPLOAD_DIR / "processed"
+
+# 确保目录存在
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 # Configure OpenAI client
 client = OpenAI(
@@ -104,6 +117,45 @@ def improve_resume(resume_text, job_role):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成简历建议时出错：{str(e)}")
 
+def save_upload_file(upload_file: UploadFile) -> Path:
+    """
+    保存上传的文件到临时目录
+    
+    Args:
+        upload_file (UploadFile): 上传的文件
+    
+    Returns:
+        Path: 保存的文件路径
+    """
+    # 生成唯一文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    filename = f"{timestamp}_{unique_id}_{upload_file.filename}"
+    file_path = TEMP_DIR / filename
+    
+    try:
+        # 保存文件
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(upload_file.file, buffer)
+        return file_path
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件保存失败：{str(e)}")
+
+def cleanup_old_files(directory: Path, max_age_hours: int = 24):
+    """
+    清理指定目录中的旧文件
+    
+    Args:
+        directory (Path): 要清理的目录
+        max_age_hours (int): 文件保留的最大小时数
+    """
+    current_time = datetime.now()
+    for file_path in directory.glob("*"):
+        if file_path.is_file():
+            file_age = current_time - datetime.fromtimestamp(file_path.stat().st_mtime)
+            if file_age.total_seconds() > max_age_hours * 3600:
+                file_path.unlink()
+
 @app.post("/match-resume/")
 async def match_resume(
     file: UploadFile = File(...),
@@ -113,27 +165,37 @@ async def match_resume(
     处理简历匹配请求的端点
     """
     try:
-        # 创建临时文件来存储上传的PDF
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(await file.read())
-            tmp_file_path = tmp_file.name
-
-        # 提取PDF文本
-        resume_text = extract_text_from_pdf(tmp_file_path)
+        # 清理旧文件
+        cleanup_old_files(TEMP_DIR)
+        cleanup_old_files(PROCESSED_DIR)
         
-        # 删除临时文件
-        os.unlink(tmp_file_path)
+        # 保存上传的文件
+        file_path = save_upload_file(file)
         
-        # 计算匹配分数
-        match_score = calculate_match_score(resume_text, job_role)
-        
-        # 获取改进建议
-        suggestions = improve_resume(resume_text, job_role)
-        
-        return {
-            "match_score": f"{match_score:.2f}%",
-            "suggestions": suggestions
-        }
-        
+        try:
+            # 提取PDF文本
+            resume_text = extract_text_from_pdf(str(file_path))
+            
+            # 计算匹配分数
+            match_score = calculate_match_score(resume_text, job_role)
+            
+            # 获取改进建议
+            suggestions = improve_resume(resume_text, job_role)
+            
+            # 处理完成后移动到processed目录
+            processed_path = PROCESSED_DIR / file_path.name
+            shutil.move(str(file_path), str(processed_path))
+            
+            return {
+                "match_score": f"{match_score:.2f}%",
+                "suggestions": suggestions
+            }
+            
+        except Exception as e:
+            # 发生错误时删除临时文件
+            if file_path.exists():
+                file_path.unlink()
+            raise e
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理简历时出错：{str(e)}")
