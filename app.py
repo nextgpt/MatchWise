@@ -1,26 +1,29 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 import pdfplumber
 import torch
-from transformers import AutoTokenizer, AutoModel
-from peft import PeftModel
-import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 import tempfile
+from openai import OpenAI
+from fastapi.middleware.cors import CORSMiddleware
+from sentence_transformers import SentenceTransformer
+import json
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
 
-# Load the fine-tuned PEFT model
-base_model_name = "sentence-transformers/all-MiniLM-L6-v2"
-tokenizer = AutoTokenizer.from_pretrained("saved_model")
-base_model = AutoModel.from_pretrained(base_model_name)
-model = PeftModel.from_pretrained(base_model, "saved_model")
-model.eval()
+# Configure OpenAI client
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_API_BASE")
+)
+MODEL_ID = os.getenv("MODEL_ID")
 
-# Load API Key for Gemini AI
-load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+# Configure base model
+base_model_name = os.getenv("BASE_MODEL_NAME")
+base_model = SentenceTransformer(base_model_name)
 
 def extract_text_from_pdf(pdf_path):
     """
@@ -43,7 +46,7 @@ def extract_text_from_pdf(pdf_path):
 
 def calculate_match_score(resume_text, job_role):
     """
-    Calculate match score between resume and job role using PEFT model.
+    Calculate match score between resume and job role using SentenceTransformer.
     
     Args:
         resume_text (str): Text extracted from resume
@@ -53,97 +56,84 @@ def calculate_match_score(resume_text, job_role):
         float: Match score percentage
     """
     try:
-        # Encode resume and job role separately
-        resume_inputs = tokenizer(resume_text, padding=True, truncation=True, return_tensors="pt")
-        job_inputs = tokenizer(job_role, padding=True, truncation=True, return_tensors="pt")
+        # 使用SentenceTransformer编码文本
+        resume_embedding = base_model.encode(resume_text, convert_to_tensor=True)
+        job_embedding = base_model.encode(job_role, convert_to_tensor=True)
         
-        with torch.no_grad():
-            # Use base model to get embeddings
-            resume_outputs = model.base_model(
-                input_ids=resume_inputs['input_ids'], 
-                attention_mask=resume_inputs['attention_mask']
-            )
-            job_outputs = model.base_model(
-                input_ids=job_inputs['input_ids'], 
-                attention_mask=job_inputs['attention_mask']
-            )
-            
-            # Use pooler output for similarity calculation
-            resume_embedding = resume_outputs.pooler_output
-            job_embedding = job_outputs.pooler_output
-        
-        # Compute cosine similarity score
-        similarity_score = torch.nn.functional.cosine_similarity(resume_embedding, job_embedding)
-        return float(similarity_score[0]) * 100  # Convert to percentage
+        # 计算余弦相似度
+        similarity_score = torch.nn.functional.cosine_similarity(resume_embedding.unsqueeze(0), job_embedding.unsqueeze(0))
+        return float(similarity_score[0]) * 100  # 转换为百分比
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating match score: {str(e)}")
 
 def improve_resume(resume_text, job_role):
     """
-    Generate resume improvement suggestions using Gemini AI.
+    使用vLLM服务生成简历改进建议。
     
     Args:
-        resume_text (str): Text extracted from resume
-        job_role (str): Job role description
+        resume_text (str): 从简历提取的文本
+        job_role (str): 职位描述
     
     Returns:
-        str: Improvement suggestions
+        str: 改进建议
     """
     try:
-        prompt = f"""
-        Given this resume:
-        {resume_text}
+        prompt = f"""作为一位专业的简历顾问，请分析以下简历和职位要求，提供3-5条具体的、可操作的建议，以提高简历与职位要求的匹配度。
+
+简历内容：
+{resume_text}
+
+目标职位：
+{job_role}
+
+请重点关注技能、经验和表述方面的差距，提供清晰具体的改进建议，帮助候选人提高竞争力。建议应该具体且可执行，避免泛泛而谈。请用中文回答。"""
+
+        response = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[
+                {"role": "system", "content": "你是一位专业的简历顾问，负责提供具体的、可操作的简历改进建议。请始终使用中文回答。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
         
-        And this job role:
-        {job_role}
-        
-        Provide 3-5 specific, actionable suggestions to improve the resume's alignment with the job requirements. 
-        Focus on skills, experience, and language that would make the candidate more competitive.
-        """
-        
-        response = gemini_model.generate_content(prompt)
-        return response.text if response else "No suggestions available."
+        return response.choices[0].message.content if response.choices else "暂无建议。"
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating resume suggestions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"生成简历建议时出错：{str(e)}")
 
 @app.post("/match-resume/")
-async def match_resume(file: UploadFile = File(...), job_role: str = Form(...)):
+async def match_resume(
+    file: UploadFile = File(...),
+    job_role: str = Form(...)
+):
     """
-    API endpoint to match resume with job role.
-    
-    Args:
-        file (UploadFile): Uploaded PDF resume
-        job_role (str): Job role description
-    
-    Returns:
-        dict: Match score and improvement suggestions
+    处理简历匹配请求的端点
     """
-    # Use tempfile to safely handle file uploads
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        try:
-            # Save uploaded file
-            temp_file.write(await file.read())
-            temp_file.close()
-            
-            # Extract text from PDF
-            resume_text = extract_text_from_pdf(temp_file.name)
-            
-            # Compute match score
-            match_score = calculate_match_score(resume_text, job_role)
-            
-            # Get resume improvement suggestions
-            suggestions = improve_resume(resume_text, job_role)
-            
-            return {
-                "match_score": f"{match_score:.2f}%",
-                "suggestions": suggestions
-            }
+    try:
+        # 创建临时文件来存储上传的PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(await file.read())
+            tmp_file_path = tmp_file.name
+
+        # 提取PDF文本
+        resume_text = extract_text_from_pdf(tmp_file_path)
         
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        # 删除临时文件
+        os.unlink(tmp_file_path)
         
-        finally:
-            # Ensure temporary file is deleted
-            os.unlink(temp_file.name)
+        # 计算匹配分数
+        match_score = calculate_match_score(resume_text, job_role)
+        
+        # 获取改进建议
+        suggestions = improve_resume(resume_text, job_role)
+        
+        return {
+            "match_score": f"{match_score:.2f}%",
+            "suggestions": suggestions
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"处理简历时出错：{str(e)}")
